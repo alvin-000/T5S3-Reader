@@ -47,6 +47,21 @@ class EpubReaderMenuActivity final : public Activity {
   static std::vector<MenuItem> buildMenuItems(bool hasFootnotes, bool hasBookmarks);
   void confirmSelection();
 
+  // The two large touch buttons live just after the menu rows in the selection order.
+  int backlightButtonIndex() const { return static_cast<int>(menuItems.size()); }
+  int shutdownButtonIndex() const { return static_cast<int>(menuItems.size()) + 1; }
+  int totalSelectableCount() const { return static_cast<int>(menuItems.size()) + 2; }
+
+  // Shared geometry so render() and onTouchTap() agree on where things are drawn.
+  void computeContentLayout(int& contentX, int& contentY, int& contentWidth) const;
+  void getActionButtonLayout(int& x, int& width, int& height, int& backlightY, int& shutdownY) const;
+  void drawButtonBox(int x, int y, int width, int height, bool focused);
+  void drawActionButton(int x, int y, int width, int height, bool focused, const std::string& label);
+  void drawBacklightButton(int x, int y, int width, int height, bool focused, int level);
+
+  void applyBacklightLevel(int level);
+  void triggerShutdown();
+
   // Fixed menu layout
   const std::vector<MenuItem> menuItems;
 

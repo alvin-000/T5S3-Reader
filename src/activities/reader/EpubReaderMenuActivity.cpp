@@ -1,9 +1,13 @@
 #include "EpubReaderMenuActivity.h"
 
+#include <BoardT5S3.h>
 #include <GfxRenderer.h>
 #include <I18n.h>
 
+#include "CrossPointSettings.h"
 #include "MappedInputManager.h"
+#include "PowerControl.h"
+#include "activities/util/ConfirmationActivity.h"
 #include "components/UITheme.h"
 #include "fontIds.h"
 
@@ -50,16 +54,29 @@ void EpubReaderMenuActivity::onEnter() {
 void EpubReaderMenuActivity::onExit() { Activity::onExit(); }
 
 void EpubReaderMenuActivity::loop() {
-  // Handle navigation
-  buttonNavigator.onNext([this] {
-    selectedIndex = ButtonNavigator::nextIndex(selectedIndex, static_cast<int>(menuItems.size()));
+  const auto moveNext = [this] {
+    selectedIndex = ButtonNavigator::nextIndex(selectedIndex, totalSelectableCount());
     requestUpdate();
-  });
+  };
+  const auto movePrevious = [this] {
+    selectedIndex = ButtonNavigator::previousIndex(selectedIndex, totalSelectableCount());
+    requestUpdate();
+  };
 
-  buttonNavigator.onPrevious([this] {
-    selectedIndex = ButtonNavigator::previousIndex(selectedIndex, static_cast<int>(menuItems.size()));
-    requestUpdate();
-  });
+  if (selectedIndex == backlightButtonIndex()) {
+    // While the backlight button is focused, Left/Right adjust brightness and only
+    // Up/Down navigate, so the two functions don't collide on the same buttons.
+    buttonNavigator.onPressAndContinuous({MappedInputManager::Button::Right},
+                                         [this] { applyBacklightLevel(SETTINGS.backlightLevel + 1); });
+    buttonNavigator.onPressAndContinuous({MappedInputManager::Button::Left},
+                                         [this] { applyBacklightLevel(SETTINGS.backlightLevel - 1); });
+    buttonNavigator.onPressAndContinuous({MappedInputManager::Button::Down}, moveNext);
+    buttonNavigator.onPressAndContinuous({MappedInputManager::Button::Up}, movePrevious);
+  } else {
+    // Handle navigation (Up/Left = previous, Down/Right = next).
+    buttonNavigator.onNext(moveNext);
+    buttonNavigator.onPrevious(movePrevious);
+  }
 
   if (mappedInput.wasReleased(MappedInputManager::Button::Confirm)) {
     confirmSelection();
@@ -74,27 +91,57 @@ void EpubReaderMenuActivity::loop() {
   }
 }
 
-bool EpubReaderMenuActivity::onTouchTap(int16_t, int16_t y) {
+bool EpubReaderMenuActivity::onTouchTap(int16_t x, int16_t y) {
   const auto orientation = renderer.getOrientation();
   const bool isPortraitInverted = orientation == GfxRenderer::Orientation::PortraitInverted;
   const int contentY = isPortraitInverted ? 50 : 0;
   const int startY = 75 + contentY;
   constexpr int lineHeight = 30;
 
-  if (y < startY) {
-    return false;
-  }
-  const int row = (y - startY) / lineHeight;
-  if (row < 0 || row >= static_cast<int>(menuItems.size())) {
-    return false;
+  // Menu rows.
+  if (y >= startY) {
+    const int row = (y - startY) / lineHeight;
+    if (row >= 0 && row < static_cast<int>(menuItems.size())) {
+      selectedIndex = row;
+      confirmSelection();
+      return true;
+    }
   }
 
-  selectedIndex = row;
-  confirmSelection();
-  return true;
+  // The two large action buttons below the list.
+  int bx, bw, bh, backlightY, shutdownY;
+  getActionButtonLayout(bx, bw, bh, backlightY, shutdownY);
+  if (x >= bx && x < bx + bw) {
+    if (y >= backlightY && y < backlightY + bh) {
+      // Large touch targets: the left half of the button decreases brightness, the
+      // right half increases it (the -/+ glyphs sit at the ends as affordances).
+      selectedIndex = backlightButtonIndex();
+      applyBacklightLevel(x < bx + bw / 2 ? SETTINGS.backlightLevel - 1 : SETTINGS.backlightLevel + 1);
+      requestUpdate();
+      return true;
+    }
+    if (y >= shutdownY && y < shutdownY + bh) {
+      selectedIndex = shutdownButtonIndex();
+      confirmSelection();
+      return true;
+    }
+  }
+
+  return false;
 }
 
 void EpubReaderMenuActivity::confirmSelection() {
+  if (selectedIndex == backlightButtonIndex()) {
+    // Confirm/tap cycles the shared global backlight level up, wrapping 10 -> 0.
+    applyBacklightLevel(SETTINGS.backlightLevel >= 10 ? 0 : SETTINGS.backlightLevel + 1);
+    return;
+  }
+
+  if (selectedIndex == shutdownButtonIndex()) {
+    triggerShutdown();
+    return;
+  }
+
   const auto selectedAction = menuItems[selectedIndex].action;
   if (selectedAction == MenuAction::ROTATE_SCREEN) {
     // Cycle orientation preview locally; actual rotation happens on menu exit.
@@ -113,23 +160,37 @@ void EpubReaderMenuActivity::confirmSelection() {
   finish();
 }
 
+void EpubReaderMenuActivity::applyBacklightLevel(int level) {
+  if (level < 0) level = 0;
+  if (level > 10) level = 10;
+  if (level == SETTINGS.backlightLevel) {
+    return;
+  }
+  // Established live-apply flow: update the shared setting, apply it, persist, redraw.
+  SETTINGS.backlightLevel = static_cast<uint8_t>(level);
+  BoardT5S3::setBacklightLevel(SETTINGS.backlightLevel);
+  SETTINGS.saveToFile();
+  requestUpdate();
+}
+
+void EpubReaderMenuActivity::triggerShutdown() {
+  if (SETTINGS.confirmShutdown) {
+    startActivityForResult(std::make_unique<ConfirmationActivity>(renderer, mappedInput, I18N.get(StrId::STR_SHUTDOWN),
+                                                                  I18N.get(StrId::STR_SHUTDOWN_PROMPT)),
+                           [](const ActivityResult& result) {
+                             if (!result.isCancelled) {
+                               requestShutdown();
+                             }
+                           });
+    return;
+  }
+  requestShutdown();
+}
+
 void EpubReaderMenuActivity::render(RenderLock&&) {
   renderer.clearScreen();
-  const auto pageWidth = renderer.getScreenWidth();
-  const auto orientation = renderer.getOrientation();
-  // Landscape orientation: button hints are drawn along a vertical edge, so we
-  // reserve a horizontal gutter to prevent overlap with menu content.
-  const bool isLandscapeCw = orientation == GfxRenderer::Orientation::LandscapeClockwise;
-  const bool isLandscapeCcw = orientation == GfxRenderer::Orientation::LandscapeCounterClockwise;
-  // Inverted portrait: button hints appear near the logical top, so we reserve
-  // vertical space to keep the header and list clear.
-  const bool isPortraitInverted = orientation == GfxRenderer::Orientation::PortraitInverted;
-  const int hintGutterWidth = (isLandscapeCw || isLandscapeCcw) ? 30 : 0;
-  // Landscape CW places hints on the left edge; CCW keeps them on the right.
-  const int contentX = isLandscapeCw ? hintGutterWidth : 0;
-  const int contentWidth = pageWidth - hintGutterWidth;
-  const int hintGutterHeight = isPortraitInverted ? 50 : 0;
-  const int contentY = hintGutterHeight;
+  int contentX, contentY, contentWidth;
+  computeContentLayout(contentX, contentY, contentWidth);
 
   // Title
   const std::string truncTitle = BaseTheme::truncatedTextForRole(renderer, UI_12_FONT_ID, TextRole::UserContent,
@@ -183,9 +244,93 @@ void EpubReaderMenuActivity::render(RenderLock&&) {
     }
   }
 
+  // Large touch buttons in the blank area below the list: Backlight and Shut Down.
+  int bx, bw, bh, backlightY, shutdownY;
+  getActionButtonLayout(bx, bw, bh, backlightY, shutdownY);
+
+  drawBacklightButton(bx, backlightY, bw, bh, selectedIndex == backlightButtonIndex(), SETTINGS.backlightLevel);
+  drawActionButton(bx, shutdownY, bw, bh, selectedIndex == shutdownButtonIndex(), I18N.get(StrId::STR_SHUTDOWN));
+
   // Footer / Hints
   const auto labels = mappedInput.mapLabels(tr(STR_BACK), tr(STR_SELECT), tr(STR_DIR_UP), tr(STR_DIR_DOWN));
   GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
 
   renderer.displayBuffer();
+}
+
+void EpubReaderMenuActivity::computeContentLayout(int& contentX, int& contentY, int& contentWidth) const {
+  const auto pageWidth = renderer.getScreenWidth();
+  const auto orientation = renderer.getOrientation();
+  // Landscape orientation: button hints are drawn along a vertical edge, so we
+  // reserve a horizontal gutter to prevent overlap with menu content.
+  const bool isLandscapeCw = orientation == GfxRenderer::Orientation::LandscapeClockwise;
+  const bool isLandscapeCcw = orientation == GfxRenderer::Orientation::LandscapeCounterClockwise;
+  // Inverted portrait: button hints appear near the logical top, so we reserve
+  // vertical space to keep the header and list clear.
+  const bool isPortraitInverted = orientation == GfxRenderer::Orientation::PortraitInverted;
+  const int hintGutterWidth = (isLandscapeCw || isLandscapeCcw) ? 30 : 0;
+  // Landscape CW places hints on the left edge; CCW keeps them on the right.
+  contentX = isLandscapeCw ? hintGutterWidth : 0;
+  contentWidth = pageWidth - hintGutterWidth;
+  contentY = isPortraitInverted ? 50 : 0;
+}
+
+void EpubReaderMenuActivity::getActionButtonLayout(int& x, int& width, int& height, int& backlightY,
+                                                   int& shutdownY) const {
+  int contentX, contentY, contentWidth;
+  computeContentLayout(contentX, contentY, contentWidth);
+
+  constexpr int lineHeight = 30;
+  const int startY = 75 + contentY;
+  const int listBottom = startY + static_cast<int>(menuItems.size()) * lineHeight;
+
+  constexpr int sidePadding = 20;
+  constexpr int topGap = 20;
+  constexpr int buttonGap = 14;
+  height = 60;
+  x = contentX + sidePadding;
+  width = contentWidth - sidePadding * 2;
+  backlightY = listBottom + topGap;
+  shutdownY = backlightY + height + buttonGap;
+}
+
+void EpubReaderMenuActivity::drawButtonBox(int x, int y, int width, int height, bool focused) {
+  constexpr int cornerRadius = 12;
+  if (focused) {
+    renderer.fillRoundedRect(x, y, width, height, cornerRadius, Color::Black);
+  } else {
+    renderer.drawRoundedRect(x, y, width, height, 2, cornerRadius, true);
+  }
+}
+
+void EpubReaderMenuActivity::drawActionButton(int x, int y, int width, int height, bool focused,
+                                              const std::string& label) {
+  drawButtonBox(x, y, width, height, focused);
+  // Text is white on the filled (focused) button, black on the outlined one.
+  const bool textBlack = !focused;
+  const int lineHeight = renderer.getLineHeight(UI_10_FONT_ID);
+  const int textY = y + (height - lineHeight) / 2;
+  const int labelWidth = renderer.getTextWidth(UI_10_FONT_ID, label.c_str());
+  renderer.drawText(UI_10_FONT_ID, x + (width - labelWidth) / 2, textY, label.c_str(), textBlack);
+}
+
+void EpubReaderMenuActivity::drawBacklightButton(int x, int y, int width, int height, bool focused, int level) {
+  drawButtonBox(x, y, width, height, focused);
+  const bool textBlack = !focused;
+
+  // "Backlight  N" centered in the middle of the button.
+  const std::string centerText = std::string(I18N.get(StrId::STR_BACKLIGHT)) + "   " + std::to_string(level);
+  const int lineHeight = renderer.getLineHeight(UI_10_FONT_ID);
+  const int textY = y + (height - lineHeight) / 2;
+  const int centerWidth = renderer.getTextWidth(UI_10_FONT_ID, centerText.c_str());
+  renderer.drawText(UI_10_FONT_ID, x + (width - centerWidth) / 2, textY, centerText.c_str(), textBlack);
+
+  // Large -/+ affordances at each end (drawn bold for prominence). The whole left/right
+  // halves of the button are the touch targets, handled in onTouchTap().
+  const int glyphLineHeight = renderer.getLineHeight(UI_12_FONT_ID);
+  const int glyphY = y + (height - glyphLineHeight) / 2;
+  constexpr int glyphPadding = 26;
+  renderer.drawText(UI_12_FONT_ID, x + glyphPadding, glyphY, "-", textBlack, EpdFontFamily::BOLD);
+  const int plusWidth = renderer.getTextWidth(UI_12_FONT_ID, "+", EpdFontFamily::BOLD);
+  renderer.drawText(UI_12_FONT_ID, x + width - glyphPadding - plusWidth, glyphY, "+", textBlack, EpdFontFamily::BOLD);
 }
