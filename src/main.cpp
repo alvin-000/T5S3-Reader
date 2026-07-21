@@ -219,7 +219,7 @@ void enterDeepSleep() {
   }
 
   HalPowerManager::Lock powerLock;  // Ensure we are at normal CPU frequency for sleep preparation
-  APP_STATE.lastSleepFromReader = activityManager.isReaderActivity();
+  APP_STATE.lastSleepFromReader = APP_STATE.lastSleepFromReader || activityManager.isReaderActivityInStack();
   APP_STATE.saveToFile();
 
   activityManager.goToSleep();
@@ -234,7 +234,7 @@ void enterDeepSleep() {
 
 void enterDeepSleepKeepingScreen(bool wakeOnTouch = true) {
   HalPowerManager::Lock powerLock;
-  APP_STATE.lastSleepFromReader = activityManager.isReaderActivity();
+  APP_STATE.lastSleepFromReader = APP_STATE.lastSleepFromReader || activityManager.isReaderActivityInStack();
   APP_STATE.saveToFile();
 
   BoardT5S3::setBacklightLevel(0);
@@ -248,7 +248,7 @@ void enterDeepSleepKeepingScreen(bool wakeOnTouch = true) {
 void enterPowerOffKeepingScreen(const char* status) {
   {
     HalPowerManager::Lock powerLock;
-    APP_STATE.lastSleepFromReader = activityManager.isReaderActivity();
+    APP_STATE.lastSleepFromReader = activityManager.isReaderActivityInStack();
     APP_STATE.saveToFile();
     display.deepSleep();
 
@@ -323,7 +323,7 @@ HalDisplay::RefreshMode readerResumeRefreshMode() {
 }
 
 bool shouldResumeReaderOnBoot() {
-  return !APP_STATE.openEpubPath.empty() && APP_STATE.lastSleepFromReader &&
+  return SETTINGS.resumeReaderOnBoot && !APP_STATE.openEpubPath.empty() && APP_STATE.lastSleepFromReader &&
          !mappedInputManager.isPressed(MappedInputManager::Button::Back) && APP_STATE.readerActivityLoadCount == 0;
 }
 
